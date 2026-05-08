@@ -157,16 +157,38 @@ function findElementByFieldId(fieldId, detectedFields) {
 function fillFields(fieldMapping, detectedFields, skipFilled = false) {
   const result = { filled: 0, skipped: 0, alreadyFilled: 0, errors: [] };
 
+  console.log('[FillFields] Starting fill — mapping keys:', Object.keys(fieldMapping).length, '| detected fields:', detectedFields.length);
+
   for (const [fieldId, value] of Object.entries(fieldMapping)) {
-    if (value === null || value === undefined) { result.skipped++; continue; }
-    if (skipFilled && isFieldAlreadyFilled(fieldId)) { result.alreadyFilled++; continue; }
+    if (value === null || value === undefined) {
+      console.log('[FillFields] SKIP (null value):', fieldId);
+      result.skipped++;
+      continue;
+    }
+    if (skipFilled && isFieldAlreadyFilled(fieldId)) {
+      console.log('[FillFields] SKIP (already filled):', fieldId);
+      result.alreadyFilled++;
+      continue;
+    }
 
     const el = findElementByFieldId(fieldId, detectedFields);
-    if (!el) { result.errors.push({ fieldId, error: 'Element not found' }); result.skipped++; continue; }
+    if (!el) {
+      console.warn('[FillFields] FAIL (element not found):', fieldId, '→ value was:', value);
+      result.errors.push({ fieldId, error: 'Element not found' });
+      result.skipped++;
+      continue;
+    }
 
+    console.log('[FillFields] Filling:', fieldId, '→', value, '| tag:', el.tagName, '| type:', el.type);
     const ok = fillFieldByType(el, value, skipFilled);
-    if (ok) result.filled++;
-    else { result.errors.push({ fieldId, error: 'Fill failed' }); result.skipped++; }
+    if (ok) {
+      console.log('[FillFields] ✓ Filled:', fieldId);
+      result.filled++;
+    } else {
+      console.warn('[FillFields] ✗ Fill failed:', fieldId);
+      result.errors.push({ fieldId, error: 'Fill failed' });
+      result.skipped++;
+    }
   }
 
   return result;

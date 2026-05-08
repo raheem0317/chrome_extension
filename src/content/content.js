@@ -70,6 +70,7 @@
         const fields = detectAllFields();
         cachedFields = fields;
         console.log('[Content] Detected', fields.length, 'fields');
+        console.log('[Content] Field IDs:', fields.map(f => f.id));
         // Strip element refs before sending (not serialisable)
         return {
           success: true,
@@ -82,16 +83,29 @@
         const { fieldMapping, detectedFields } = message.payload || {};
         if (!fieldMapping) return { success: false, error: 'No fieldMapping provided' };
 
+        console.log('[Content] FILL_FIELDS received');
+        console.log('[Content] fieldMapping keys:', Object.keys(fieldMapping));
+        console.log('[Content] fieldMapping:', JSON.stringify(fieldMapping));
+        console.log('[Content] cachedFields count:', cachedFields.length);
+        console.log('[Content] cachedFields with element refs:', cachedFields.filter(f => f.element).length);
+
         // Merge any freshly passed detectedFields with cached (keep element refs)
         if (detectedFields?.length) mergeIntoCache(detectedFields);
 
+        // Re-resolve element references for any cached fields missing them
+        resolveElementRefs();
+
+        console.log('[Content] After resolve — cachedFields with element refs:', cachedFields.filter(f => f.element).length);
+
         const result = fillAllFields(fieldMapping, cachedFields, false);
+        console.log('[Content] Fill result:', JSON.stringify(result));
         return { success: true, ...result };
       }
 
       case 'SHOW_REVIEW_MODAL': {
         const { jobId, fieldMapping, detectedFields } = message.payload || {};
         if (detectedFields?.length) mergeIntoCache(detectedFields);
+        resolveElementRefs();
 
         showReviewModal(jobId, fieldMapping);
         return { success: true };
@@ -114,7 +128,30 @@
     for (const incoming of incomingFields) {
       if (!cachedFields.find(c => c.id === incoming.id)) {
         const el = findElementByFieldId(incoming.id);
-        if (el) cachedFields.push({ ...incoming, element: el });
+        if (el) {
+          cachedFields.push({ ...incoming, element: el });
+          console.log('[Content] Merged field into cache:', incoming.id, '→ element found');
+        } else {
+          cachedFields.push({ ...incoming, element: null });
+          console.warn('[Content] Merged field into cache:', incoming.id, '→ NO element found');
+        }
+      }
+    }
+  }
+
+  /**
+   * Re-resolve DOM element references for all cached fields.
+   * Handles the case where element refs were lost due to serialization round-trip.
+   */
+  function resolveElementRefs() {
+    for (const field of cachedFields) {
+      if (!field.element || !document.body.contains(field.element)) {
+        const el = findElementByFieldId(field.id);
+        if (el) {
+          field.element = el;
+        } else {
+          console.warn('[Content] resolveElementRefs: no element found for', field.id);
+        }
       }
     }
   }
@@ -123,6 +160,7 @@
     // fieldId format: "id:xxx|name:yyy|type:zzz"
     const idMatch = fieldId.match(/id:([^|]+)/);
     const nameMatch = fieldId.match(/name:([^|]+)/);
+
     if (idMatch?.[1]) {
       const el = document.getElementById(idMatch[1]);
       if (el) return el;
@@ -131,6 +169,15 @@
       const el = document.querySelector(`[name="${nameMatch[1]}"]`);
       if (el) return el;
     }
+
+    // Fallback: try querySelector with the actual id/name values
+    if (idMatch?.[1]) {
+      try {
+        const el = document.querySelector(`#${CSS.escape(idMatch[1])}`);
+        if (el) return el;
+      } catch (_) {}
+    }
+
     return null;
   }
 
