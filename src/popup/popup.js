@@ -4,6 +4,11 @@
  * KEY DESIGN: Popup NEVER awaits long-running operations.
  * It starts a job, gets a jobId, then polls every second.
  * Popup can close safely at any time — the job continues in background.
+ * 
+ * STATE ARCHITECTURE:
+ *   - hasApiKey: boolean — sourced ONLY from background.js (chrome.storage.local)
+ *   - profile: object   — sourced from chrome.storage.local via storage.js
+ *   - UI rendering derives from state, NEVER from masked input field values
  */
 
 import { saveProfile, loadProfile, getLastUpdated, isStorageAvailable } from './storage.js';
@@ -11,10 +16,15 @@ import { validateFormData, sanitizeFormData, getFirstError } from './validation.
 
 class PopupController {
   constructor() {
+    // ─── Persistent state (sourced from storage, not DOM) ──────────────
     this.profile = null;
+    this.hasApiKey = false;          // ← THE FIX: tracked as state, not DOM value
     this.storageAvailable = false;
+
+    // ─── Transient state ───────────────────────────────────────────────
     this.activeJobId = null;
     this.pollTimer = null;
+
     this.init();
   }
 
@@ -28,10 +38,13 @@ class PopupController {
         this.showToast('Storage not available', 'error');
       }
 
+      // Load persistent state from storage → then render UI from state
       await this.loadProfile();
-      await this.loadApiKeyStatus();
+      await this.syncApiKeyState();   // ← fetches truth from background.js
       this.updateStatus();
       await this.resumePendingJob();
+
+      console.log('[Popup] Initialised — hasApiKey:', this.hasApiKey, '| hasProfile:', !!(this.profile?.name && this.profile?.email));
     } catch (err) {
       console.error('[Popup] Init error:', err);
       this.showToast('Failed to initialise extension', 'error');
@@ -89,6 +102,7 @@ class PopupController {
       const res = await loadProfile();
       this.profile = res.success ? res.profile : this.defaultProfile();
       this.populateForm();
+      console.log('[Popup] Profile loaded:', this.profile?.name ? 'yes' : 'empty');
     } finally {
       this.hideLoading();
     }
@@ -119,6 +133,7 @@ class PopupController {
       const res = await saveProfile(sanitized);
       if (!res.success) throw new Error(res.error);
       this.profile = sanitized;
+      console.log('[Popup] Profile saved successfully');
       this.showToast('Profile saved!', 'success');
       this.updateStatus();
     } catch (err) {
@@ -128,32 +143,68 @@ class PopupController {
     }
   }
 
-  // ─── API Key ───────────────────────────────────────────────────────────────
+  // ─── API Key State Management ──────────────────────────────────────────────
+  //
+  // ARCHITECTURE:
+  //   chrome.storage.local  →  background.js (GET_API_KEY)  →  this.hasApiKey
+  //   UI rendering uses this.hasApiKey, NEVER the masked input field value.
+  //   The popup NEVER sees the raw API key — only whether one exists.
 
-  async loadApiKeyStatus() {
+  /**
+   * Fetch API key existence from background.js (the single source of truth).
+   * Sets this.hasApiKey and updates the input mask accordingly.
+   */
+  async syncApiKeyState() {
     try {
       const res = await chrome.runtime.sendMessage({ type: 'GET_API_KEY' });
-      if (res?.success && res.hasKey) {
+      this.hasApiKey = !!(res?.success && res.hasKey);
+      console.log('[Popup] [Storage] API key state synced — hasApiKey:', this.hasApiKey);
+
+      // Show mask if key exists, clear if not
+      if (this.hasApiKey) {
         this.els.apiKey.value = '••••••••••••••••';
       }
     } catch (err) {
-      console.error('[Popup] loadApiKeyStatus error:', err);
+      console.error('[Popup] [Storage] syncApiKeyState error:', err);
+      this.hasApiKey = false;
     }
   }
 
+  /**
+   * Save API key via background.js, then re-sync state from storage.
+   */
   async handleSaveApiKey() {
     const key = this.els.apiKey.value.trim();
+
+    // ─── Client-side validation ──────────────────────────────────────
     if (!key) return this.showToast('Enter an API key', 'error');
+    if (key === '••••••••••••••••') return this.showToast('Key already saved', 'success');
     if (!key.startsWith('sk-or-')) return this.showToast('OpenRouter keys start with sk-or-', 'error');
 
+    console.log('[Popup] Saving API key...');
     this.showLoading('Saving API key...');
+
     try {
+      // ─── Send to background for secure storage ─────────────────────
       const res = await chrome.runtime.sendMessage({ type: 'SAVE_API_KEY', payload: { apiKey: key } });
-      if (!res?.success) throw new Error(res?.error || 'Save failed');
+
+      if (!res?.success) {
+        throw new Error(res?.error || 'Save failed');
+      }
+
+      console.log('[Popup] [Storage] API key save confirmed by background');
+
+      // ─── Re-sync state from the actual persisted storage ───────────
+      await this.syncApiKeyState();
+
+      // Mask the input field
       this.els.apiKey.value = '••••••••••••••••';
+
       this.showToast('API key saved!', 'success');
-      this.updateStatus();
+      this.updateStatus();    // ← now uses this.hasApiKey (true), not DOM value
+
     } catch (err) {
+      console.error('[Popup] [Storage] API key save error:', err);
       this.showToast(err.message, 'error');
     } finally {
       this.hideLoading();
@@ -303,20 +354,32 @@ class PopupController {
     };
   }
 
+  /**
+   * Update status indicator based on PERSISTENT STATE, not DOM values.
+   * 
+   * Uses:
+   *   this.hasApiKey  — boolean from background.js (storage truth)
+   *   this.profile    — object from chrome.storage.local
+   * 
+   * Never checks input field values for status determination.
+   */
   updateStatus() {
-    const hasProfile = this.profile?.name && this.profile?.email;
-    const hasKey = this.els.apiKey.value && this.els.apiKey.value !== '••••••••••••••••';
+    const hasProfile = !!(this.profile?.name && this.profile?.email);
+
+    console.log('[Popup] updateStatus — hasProfile:', hasProfile, '| hasApiKey:', this.hasApiKey);
+
+    // Enable/disable fill button based on profile completeness
     this.els.fillFormBtn.disabled = !hasProfile;
 
-    if (hasProfile && hasKey) {
+    if (hasProfile && this.hasApiKey) {
       this.els.statusIndicator.classList.remove('incomplete');
       this.els.statusText.textContent = 'Ready';
-    } else if (!hasKey) {
+    } else if (!this.hasApiKey) {
       this.els.statusIndicator.classList.add('incomplete');
       this.els.statusText.textContent = 'No API key';
     } else {
       this.els.statusIndicator.classList.add('incomplete');
-      this.els.statusText.textContent = 'Incomplete';
+      this.els.statusText.textContent = 'Incomplete profile';
     }
   }
 

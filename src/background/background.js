@@ -288,32 +288,73 @@ class BackgroundService {
     }
   }
 
-  // ─── API Key ──────────────────────────────────────────────────────────────
+  // ─── API Key Management ───────────────────────────────────────────────────
+  //
+  // SECURITY: Only background.js reads/writes the raw API key.
+  // Popup only receives { hasKey: true/false }, never the key itself.
 
   async saveApiKey({ apiKey } = {}) {
-    if (!apiKey) return { success: false, error: 'API key required' };
-    if (!validateApiKeyFormat(apiKey)) return { success: false, error: 'Invalid key format (must start with sk-or-)' };
-    await chrome.storage.local.set({ openrouterApiKey: apiKey.trim() });
-    console.log('[Background] OpenRouter API key saved');
-    return { success: true };
+    console.log('[Background] [Storage] saveApiKey called');
+
+    if (!apiKey) {
+      console.warn('[Background] [Storage] Save rejected: empty key');
+      return { success: false, error: 'API key required' };
+    }
+
+    if (!validateApiKeyFormat(apiKey)) {
+      console.warn('[Background] [Storage] Save rejected: invalid format');
+      return { success: false, error: 'Invalid key format (must start with sk-or-)' };
+    }
+
+    try {
+      await chrome.storage.local.set({ openrouterApiKey: apiKey.trim() });
+
+      // Verify the save actually persisted
+      const verification = await chrome.storage.local.get('openrouterApiKey');
+      const persisted = !!verification.openrouterApiKey;
+      console.log('[Background] [Storage] API key saved — verified persisted:', persisted);
+
+      if (!persisted) {
+        return { success: false, error: 'Key save verification failed' };
+      }
+
+      return { success: true, hasKey: true };
+    } catch (err) {
+      console.error('[Background] [Storage] Save error:', err);
+      return { success: false, error: 'Storage write failed: ' + err.message };
+    }
   }
 
   async getApiKeyStatus() {
     const key = await this.getApiKey();
-    return { success: true, hasKey: !!key };
+    const hasKey = !!key;
+    console.log('[Background] [Storage] getApiKeyStatus — hasKey:', hasKey);
+    return { success: true, hasKey };
   }
 
   async getApiKey() {
-    const { openrouterApiKey } = await chrome.storage.local.get('openrouterApiKey');
-    return openrouterApiKey || null;
+    try {
+      const { openrouterApiKey } = await chrome.storage.local.get('openrouterApiKey');
+      const exists = !!openrouterApiKey;
+      console.log('[Background] [Storage] getApiKey — exists:', exists, '| length:', openrouterApiKey?.length ?? 0);
+      return openrouterApiKey || null;
+    } catch (err) {
+      console.error('[Background] [Storage] getApiKey error:', err);
+      return null;
+    }
   }
 
   async testApiKey({ apiKey } = {}) {
-    if (!apiKey || !validateApiKeyFormat(apiKey)) return { success: false, error: 'Invalid key' };
+    console.log('[Background] testApiKey called');
+    if (!apiKey || !validateApiKeyFormat(apiKey)) {
+      console.warn('[Background] testApiKey rejected: invalid format');
+      return { success: false, error: 'Invalid key' };
+    }
     try {
       const { testConnection } = await import('./utils/api.js');
       return await testConnection(apiKey);
     } catch (err) {
+      console.error('[Background] testApiKey error:', err);
       return { success: false, error: err.message };
     }
   }
