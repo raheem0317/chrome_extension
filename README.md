@@ -1,261 +1,116 @@
-# AI Form Filler Chrome Extension
+# AI Form Filler — Chrome Extension
 
-An intelligent Chrome extension that automatically fills form fields on any webpage using AI (Groq API) and your stored user profile.
+An intelligent Chrome extension that automatically fills form fields on any webpage using AI (OpenRouter API) and your stored user profile.
 
 ## Features
 
-- **Universal Form Detection**: Works on Google Forms, JotForm, React forms, and any vanilla HTML forms
-- **AI-Powered Mapping**: Uses Groq AI to intelligently map form fields to your profile data
-- **No Site-Specific Hardcoding**: Works on any website without custom configurations
-- **Modular Architecture**: Clean, maintainable vanilla JavaScript codebase
-- **Manifest V3 Compliant**: Built with the latest Chrome extension standards
+- **AI-Powered Mapping**: Uses OpenRouter AI (with model fallback) to intelligently map form fields to your profile data
+- **Review Before Fill**: Preview and edit AI suggestions before they are applied
+- **Secure Architecture**: API key never leaves the background service worker
+- **Multi-Model Fallback**: Tries GPT-4o Mini → Claude 3.5 Sonnet → Llama 3.3 70B
+- **Production Resilience**: Retry logic, timeout handling, malformed JSON recovery
 
-## Requirements
+## Prerequisites
 
-- Google Chrome (version 88 or higher)
-- Groq API key (get one at https://console.groq.com/)
-- For development: Chrome Developer Mode enabled
+- Google Chrome (v116+)
+- OpenRouter API key (get one at https://openrouter.ai/keys)
 
 ## Installation
 
-### Development Setup
-
 1. Clone or download this repository
-2. Add icon files to the `icons/` directory:
-   - `icon-16.png` (16x16 pixels)
-   - `icon-48.png` (48x48 pixels)
-   - `icon-128.png` (128x128 pixels)
-3. Open Chrome and navigate to `chrome://extensions/`
-4. Enable "Developer mode" in the top right corner
-5. Click "Load unpacked"
-6. Select the extension directory
-
-### Production Build
-
-For Chrome Web Store submission:
-1. Ensure all icon files are properly sized
-2. Test thoroughly across different form types
-3. Create a Chrome Web Store developer account
-4. Package the extension and submit for review
+2. Open Chrome and go to `chrome://extensions/`
+3. Enable "Developer mode"
+4. Click "Load unpacked" and select this folder
 
 ## Usage
 
-### First-Time Setup
-
-1. Click the extension icon in your browser toolbar
-2. Enter your Groq API key in the "API Configuration" section
-3. Click "Save API Key"
-4. Fill in your user profile information (at minimum: First Name, Last Name, Email)
-5. Click "Save Profile"
-
-### Filling Forms
-
-1. Navigate to any webpage with a form
-2. Click the extension icon
-3. Click the "Fill Form" button
-4. The extension will:
-   - Detect all form fields on the page
-   - Send field metadata to Groq AI
-   - Receive an intelligent mapping of fields to your profile data
-   - Automatically fill the form fields
-5. A success message will show how many fields were filled
+1. Click the extension icon in the toolbar
+2. Enter your OpenRouter API key in the "API Configuration" section
+3. Fill in your profile (name, email, phone, etc.)
+4. Navigate to any webpage with a form
+5. Click "Review & Fill" or "Fill Form"
 
 ## Architecture
 
-### Folder Structure
+```
+popup.js  →  background.js  →  OpenRouter API
+                  ↓
+             content.js (DOM only)
+```
+
+### Security
+
+- **API key** is stored in `chrome.storage.local`, accessed ONLY by `background.js`
+- **popup.js** and **content.js** NEVER see the API key
+- All AI calls happen exclusively in the background service worker
+
+### How It Works
+
+1. User clicks "Fill Form" in popup
+2. Popup sends `START_FILL_JOB` message to background
+3. Background detects form fields via content script
+4. Background sends field metadata + profile to OpenRouter AI
+5. AI returns JSON mapping of field IDs → profile values
+6. Background sends mapping to content script for DOM injection
+
+## Project Structure
 
 ```
-chrome-extension/
-├── manifest.json                 # Extension manifest
-├── icons/                        # Extension icons
+├── manifest.json
 ├── src/
-│   ├── background/              # Background service worker
-│   │   ├── background.js        # Main background script
-│   │   ├── groq-api.js          # Groq API integration
-│   │   └── storage-manager.js   # Storage operations
-│   ├── content/                 # Content scripts
-│   │   ├── content.js           # Main content script
-│   │   ├── form-detector.js     # Form field detection
-│   │   ├── field-analyzer.js    # Field semantic analysis
-│   │   └── form-filler.js       # Form field filling
-│   ├── popup/                   # Popup UI
-│   │   ├── popup.html           # Popup HTML
-│   │   ├── popup.css            # Popup styles
-│   │   ├── popup.js             # Popup controller
-│   │   └── profile-editor.js    # Profile form management
-│   └── shared/                  # Shared utilities
-│       ├── constants.js         # Extension constants
-│       ├── utils.js             # Utility functions
-│       └── event-types.js       # Message type definitions
-└── README.md                    # This file
+│   ├── background/
+│   │   ├── background.js          # Service worker (job orchestrator)
+│   │   ├── utils/
+│   │   │   └── api.js             # OpenRouter API (fetch, retry, fallback)
+│   │   ├── groq-api.js            # Deprecated stub (redirects to utils/api.js)
+│   │   └── storage-manager.js     # Chrome storage helper
+│   ├── content/
+│   │   ├── content.js             # DOM-only message handler
+│   │   ├── field-analyzer.js      # Field semantic analysis
+│   │   ├── form-detector.js       # Form detection
+│   │   ├── form-filler.js         # Form filling logic
+│   │   ├── review-modal.js        # Review modal component
+│   │   ├── utils/
+│   │   │   ├── detectFields.js    # Field detection utilities
+│   │   │   ├── fillFields.js      # Field filling utilities
+│   │   │   └── notification.js    # In-page notifications
+│   │   └── components/
+│   │       └── ReviewModal.js     # Shadow DOM review modal
+│   ├── popup/
+│   │   ├── popup.html             # Extension popup UI
+│   │   ├── popup.css              # Popup styles
+│   │   ├── popup.js               # Popup controller
+│   │   ├── storage.js             # Profile storage helpers
+│   │   ├── profile-editor.js      # Profile form logic
+│   │   └── validation.js          # Input validation
+│   └── shared/
+│       ├── constants.js           # Shared constants & config
+│       ├── event-types.js         # Message type definitions
+│       └── utils.js               # Shared utilities
+└── icons/
 ```
 
-### Component Overview
+## OpenRouter API Configuration
 
-#### Background Script (`background.js`)
-- Central coordinator for extension lifecycle
-- Handles Groq API calls (avoids CORS issues)
-- Manages storage operations
-- Routes messages between popup and content scripts
+The extension uses OpenRouter with automatic model fallback:
 
-#### Content Script (`content.js`)
-- Injected into webpages
-- Orchestrates form detection and filling
-- Communicates with background script
-- Handles DOM manipulation
+| Priority | Model | Provider |
+|----------|-------|----------|
+| 1 (Primary) | `openai/gpt-4o-mini` | OpenAI |
+| 2 (Fallback) | `anthropic/claude-3.5-sonnet` | Anthropic |
+| 3 (Fallback) | `meta-llama/llama-3.3-70b-instruct` | Meta |
 
-#### Form Detector (`form-detector.js`)
-- Dynamically discovers form fields
-- Works across frameworks (React, Vue, vanilla)
-- Handles shadow DOM traversal
-- Observes DOM changes for dynamic forms
+### Resilience Features
 
-#### Field Analyzer (`field-analyzer.js`)
-- Extracts semantic meaning from fields
-- Analyzes field context (labels, placeholders)
-- Identifies field categories (name, email, phone, etc.)
+- **Timeout**: 45s per request (AbortController)
+- **Retries**: 3 attempts per model with exponential backoff
+- **Model Fallback**: Automatically tries the next model if one is unavailable
+- **JSON Recovery**: Multi-stage parsing (direct → cleanup → aggressive extraction)
+- **Error Logging**: Detailed `[OpenRouter]` `[AI]` `[Background]` prefixed logs
 
-#### Form Filler (`form-filler.js`)
-- Injects values using native DOM setters
-- Triggers proper React/Vue events
-- Handles special field types (dropdowns, checkboxes, radios)
-- Provides visual feedback
+## Security Notes
 
-#### Groq API (`groq-api.js`)
-- Constructs API requests to Groq
-- Sends field metadata + user profile
-- Parses JSON response mapping
-- Handles errors and retries
-
-#### Storage Manager (`storage-manager.js`)
-- Wraps chrome.storage.local operations
-- Manages user profile CRUD
-- Validates profile data
-
-#### Popup UI (`popup.html`, `popup.js`, `popup.css`)
-- Profile editor interface
-- API key configuration
-- Fill Form button
-- Status indicators
-
-## Communication Flow
-
-```
-User clicks "Fill Form" in popup
-    ↓
-popup.js → background.js → content.js
-    ↓
-content.js detects fields
-    ↓
-content.js → background.js (fields metadata)
-    ↓
-background.js → Groq API (fields + profile)
-    ↓
-Groq API returns field mapping
-    ↓
-background.js → content.js (mapping)
-    ↓
-content.js fills form fields
-    ↓
-content.js → popup.js (success/error)
-```
-
-## Supported Field Types
-
-- Text inputs
-- Email fields
-- Phone number fields
-- Textareas
-- Select dropdowns
-- Checkboxes
-- Radio buttons
-- URL fields
-- Date fields
-- Number fields
-
-## Privacy & Security
-
-- All data is stored locally using `chrome.storage.local`
-- API key is stored securely and never transmitted except to Groq API
-- No data is sent to any third-party services except Groq
-- Profile data is only used for form filling
-- Extension works entirely client-side
-
-## Troubleshooting
-
-### Extension not loading
-- Ensure Developer Mode is enabled in chrome://extensions/
-- Check for errors in the extension details page
-- Verify all file paths in manifest.json are correct
-
-### Forms not being detected
-- Ensure the page has fully loaded
-- Check browser console for errors
-- Some forms in iframes may not be detected
-
-### API errors
-- Verify your Groq API key is valid
-- Check you have sufficient API credits
-- Ensure you have internet connectivity
-
-### Fields not filling correctly
-- Some fields may be disabled or read-only
-- CAPTCHA fields are intentionally skipped
-- React/Vue forms may require page reload after filling
-
-## Development
-
-### Testing
-
-Test the extension on various form types:
-- Google Forms
-- JotForm
-- React-based forms
-- Vue-based forms
-- Vanilla HTML forms
-- Single-page applications
-
-### Debugging
-
-1. Open Chrome DevTools on the extension popup
-2. Check background script logs in `chrome://extensions/` → Service Worker
-3. Check content script logs in the webpage's DevTools console
-
-### Modifying the Code
-
-The codebase is modular and vanilla JavaScript. Each module is self-contained:
-
-- To modify field detection: Edit `form-detector.js`
-- To change AI prompts: Edit `groq-api.js`
-- To update the UI: Edit `popup.html` and `popup.css`
-- To add new profile fields: Update `constants.js` and popup HTML
-
-## API Configuration
-
-The extension uses Groq's LLaMA 3 model. To configure:
-
-1. Get an API key from https://console.groq.com/
-2. Enter it in the extension popup
-3. The extension uses the `llama3-70b-8192` model by default
-
-To change the model, edit `GROQ_API_CONFIG` in `src/shared/constants.js`.
-
-## License
-
-This project is provided as-is for educational and development purposes.
-
-## Contributing
-
-Contributions are welcome! Please ensure:
-- Code follows the existing modular structure
-- Vanilla JavaScript only (no frameworks)
-- Manifest V3 compliance
-- Proper error handling
-- Comments for complex logic
-
-## Support
-
-For issues or questions:
-1. Check the Troubleshooting section
-2. Review browser console for errors
-3. Verify API key and network connectivity
+- API key is stored securely and never transmitted except to OpenRouter API
+- Content scripts have no access to the API key
+- All AI processing happens in the isolated background service worker
+- No data is sent to any server other than OpenRouter

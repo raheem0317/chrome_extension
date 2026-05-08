@@ -144,7 +144,7 @@ class PopupController {
   async handleSaveApiKey() {
     const key = this.els.apiKey.value.trim();
     if (!key) return this.showToast('Enter an API key', 'error');
-    if (!key.startsWith('gsk_')) return this.showToast('Groq keys start with gsk_', 'error');
+    if (!key.startsWith('sk-or-')) return this.showToast('OpenRouter keys start with sk-or-', 'error');
 
     this.showLoading('Saving API key...');
     try {

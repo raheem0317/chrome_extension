@@ -153,7 +153,7 @@ class BackgroundService {
     // ── Step 3: load API key ───────────────────────────────────────────────
     updateJob(jobId, { progress: 'Loading API configuration...' });
     const apiKey = await this.getApiKey();
-    if (!apiKey) throw new Error('API key not configured. Add your Groq key in the extension popup.');
+    if (!apiKey) throw new Error('API key not configured. Add your OpenRouter key in the extension popup.');
 
     // ── Step 4: load profile ───────────────────────────────────────────────
     updateJob(jobId, { progress: 'Loading profile...' });
@@ -161,7 +161,7 @@ class BackgroundService {
     if (!profile?.name || !profile?.email)
       throw new Error('Profile incomplete. Fill in at least name and email.');
 
-    // ── Step 5: call Groq AI ───────────────────────────────────────────────
+    // ── Step 5: call OpenRouter AI ────────────────────────────────────────
     updateJob(jobId, { progress: 'AI is analysing form fields...' });
     const fieldMapping = await getFieldMapping(detectResp.fields, profile, apiKey);
     console.log('[Background] AI mapping:', fieldMapping);
@@ -292,9 +292,9 @@ class BackgroundService {
 
   async saveApiKey({ apiKey } = {}) {
     if (!apiKey) return { success: false, error: 'API key required' };
-    if (!validateApiKeyFormat(apiKey)) return { success: false, error: 'Invalid key format (must start with gsk_)' };
-    await chrome.storage.local.set({ groqApiKey: apiKey.trim() });
-    console.log('[Background] API key saved');
+    if (!validateApiKeyFormat(apiKey)) return { success: false, error: 'Invalid key format (must start with sk-or-)' };
+    await chrome.storage.local.set({ openrouterApiKey: apiKey.trim() });
+    console.log('[Background] OpenRouter API key saved');
     return { success: true };
   }
 
@@ -304,8 +304,8 @@ class BackgroundService {
   }
 
   async getApiKey() {
-    const { groqApiKey } = await chrome.storage.local.get('groqApiKey');
-    return groqApiKey || null;
+    const { openrouterApiKey } = await chrome.storage.local.get('openrouterApiKey');
+    return openrouterApiKey || null;
   }
 
   async testApiKey({ apiKey } = {}) {

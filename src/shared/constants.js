@@ -5,7 +5,7 @@ export const EXTENSION_VERSION = '1.0.0';
 // Storage keys
 export const STORAGE_KEYS = {
   USER_PROFILE: 'userProfile',
-  API_KEY: 'groqApiKey',
+  API_KEY: 'openrouterApiKey',
   SETTINGS: 'settings'
 };
 
@@ -63,11 +63,15 @@ export const FIELD_CATEGORIES = {
 };
 
 // API configuration
-export const GROQ_API_CONFIG = {
-  BASE_URL: 'https://api.groq.com/openai/v1/chat/completions',
-  MODEL: 'llama3-70b-8192',
+export const OPENROUTER_API_CONFIG = {
+  BASE_URL: 'https://openrouter.ai/api/v1/chat/completions',
+  MODELS: [
+    'openai/gpt-4o-mini',
+    'anthropic/claude-3.5-sonnet',
+    'meta-llama/llama-3.3-70b-instruct'
+  ],
   MAX_RETRIES: 3,
-  TIMEOUT: 30000
+  TIMEOUT: 45000
 };
 
 // Message types
