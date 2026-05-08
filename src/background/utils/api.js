@@ -1,285 +1,147 @@
 /**
- * Groq API Integration
- * Handles communication with Groq Chat Completions API
- * API calls only happen in background.js for security
+ * Groq API Utility — runs ONLY in background.js (service worker)
+ * Never imported by popup.js or content.js
  */
 
 const GROQ_API_CONFIG = {
   BASE_URL: 'https://api.groq.com/openai/v1/chat/completions',
   MODEL: 'llama-3.3-70b-versatile',
   MAX_RETRIES: 3,
-  TIMEOUT: 30000, // 30 seconds
-  TEMPERATURE: 0.3,
+  TIMEOUT_MS: 30_000,
+  TEMPERATURE: 0.2,
   MAX_TOKENS: 2048
 };
 
-/**
- * Validate JSON response from AI
- * @param {string} jsonString - The JSON string to validate
- * @returns {Object|null} - Parsed JSON object or null if invalid
- */
-function validateJSONResponse(jsonString) {
-  try {
-    const parsed = JSON.parse(jsonString);
-    
-    // Check if it's an object
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      console.error('[Groq API] Response is not a valid object');
-      return null;
-    }
-    
-    return parsed;
-  } catch (error) {
-    console.error('[Groq API] JSON parse error:', error);
-    return null;
-  }
+// ─── JSON helpers ─────────────────────────────────────────────────────────────
+
+function extractJSON(raw) {
+  if (!raw || typeof raw !== 'string') return '';
+  const codeBlock = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  if (codeBlock) return codeBlock[1].trim();
+  const obj = raw.match(/\{[\s\S]*\}/);
+  return obj ? obj[0].trim() : raw.trim();
 }
 
-/**
- * Extract JSON from AI response (handles markdown code blocks)
- * @param {string} content - The raw content from AI
- * @returns {string} - Extracted JSON string
- */
-function extractJSONFromContent(content) {
-  if (!content || typeof content !== 'string') {
-    return '';
-  }
-
-  // Remove markdown code blocks if present
-  const jsonMatch = content.match(/```json\s*([\s\S]*?)\s*```/) || 
-                   content.match(/```\s*([\s\S]*?)\s*```/) ||
-                   content.match(/\{[\s\S]*\}/);
-  
-  if (jsonMatch) {
-    return jsonMatch[1] || jsonMatch[0];
-  }
-  
-  return content.trim();
+function parseMapping(raw) {
+  const jsonStr = extractJSON(raw);
+  if (!jsonStr) throw new Error('No JSON found in AI response');
+  const parsed = JSON.parse(jsonStr);
+  if (typeof parsed !== 'object' || Array.isArray(parsed) || parsed === null)
+    throw new Error('AI response is not a plain object');
+  return parsed;
 }
 
-/**
- * Build the prompt for Groq AI
- * @param {Array<Object>} fields - Detected form fields
- * @param {Object} profile - User profile data
- * @returns {string} - The prompt string
- */
+// ─── Prompt builder ───────────────────────────────────────────────────────────
+
 function buildPrompt(fields, profile) {
-  const fieldsDescription = fields.map((field, index) => {
-    return `
-Field ${index}:
-- ID: ${field.id}
-- Type: ${field.type}
-- Name: ${field.name || 'N/A'}
-- Label: ${field.label || 'N/A'}
-- Placeholder: ${field.placeholder || 'N/A'}
-- Required: ${field.required}
-`.trim();
-  }).join('\n');
+  const fieldLines = fields.map((f, i) => [
+    `Field ${i}:`,
+    `  id: ${f.id}`,
+    `  type: ${f.type}`,
+    `  name: ${f.name || 'N/A'}`,
+    `  label: ${f.label || 'N/A'}`,
+    `  placeholder: ${f.placeholder || 'N/A'}`,
+    `  required: ${f.required}`
+  ].join('\n')).join('\n');
 
-  const profileDescription = Object.entries(profile)
-    .filter(([_, value]) => value && typeof value === 'string' && value.trim().length > 0)
-    .map(([key, value]) => `- ${key}: ${value}`)
+  const profileLines = Object.entries(profile)
+    .filter(([, v]) => v && String(v).trim())
+    .map(([k, v]) => `  ${k}: ${v}`)
     .join('\n');
 
-  return `You are a form-filling assistant. Your task is to intelligently match user profile data to form fields.
+  return `You are a form-filling assistant. Map form fields to profile values.
 
-USER PROFILE:
-${profileDescription || 'No profile data available'}
+PROFILE:
+${profileLines || '  (empty)'}
 
-FORM FIELDS:
-${fieldsDescription}
+FIELDS:
+${fieldLines}
 
-TASK:
-Analyze each field and determine which profile value (if any) should be used to fill it. Return a JSON object where:
-- Keys are the field IDs
-- Values are the corresponding profile values to fill the field
-- Use null if no suitable profile value exists for a field
+TASK: Return ONLY a valid JSON object where keys are field ids and values are the matching profile values (or null if no match). No markdown, no explanation.
 
-IMPORTANT RULES:
-1. Return ONLY valid JSON, no markdown, no code blocks, no explanations
-2. Match intelligently based on field context (e.g., "email" field → email value)
-3. Handle variations in naming (e.g., "phone", "telephone", "tel" → phone value)
-4. Use null for fields that don't have a matching profile value
-5. Do not invent or hallucinate values - only use data from the profile
-
-Response format (JSON only):
-{
-  "field_id_1": "profile_value_1",
-  "field_id_2": "profile_value_2",
-  "field_id_3": null,
-  ...
+Example:
+{"id:email|name:email|type:email": "alice@example.com", "id:name|name:name|type:text": "Alice Smith"}`;
 }
 
-Provide the JSON response now:`;
-}
+// ─── HTTP request ─────────────────────────────────────────────────────────────
 
-/**
- * Make API request to Groq with timeout
- * @param {string} prompt - The prompt to send
- * @param {string} apiKey - The Groq API key
- * @param {AbortSignal} signal - Abort signal for timeout
- * @returns {Promise<Object>} - API response
- */
-async function makeGroqRequest(prompt, apiKey, signal) {
-  const response = await fetch(GROQ_API_CONFIG.BASE_URL, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: GROQ_API_CONFIG.MODEL,
-      messages: [
-        {
-          role: 'user',
-          content: prompt
-        }
-      ],
-      temperature: GROQ_API_CONFIG.TEMPERATURE,
-      max_tokens: GROQ_API_CONFIG.MAX_TOKENS
-    }),
-    signal: signal
-  });
+async function makeRequest(prompt, apiKey) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GROQ_API_CONFIG.TIMEOUT_MS);
 
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    throw new Error(
-      `Groq API error: ${response.status} ${response.statusText}. ${errorData.error?.message || ''}`
-    );
+  try {
+    const res = await fetch(GROQ_API_CONFIG.BASE_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: GROQ_API_CONFIG.MODEL,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: GROQ_API_CONFIG.TEMPERATURE,
+        max_tokens: GROQ_API_CONFIG.MAX_TOKENS
+      }),
+      signal: controller.signal
+    });
+
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(`Groq API ${res.status}: ${body.error?.message || res.statusText}`);
+    }
+
+    return await res.json();
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === 'AbortError') throw new Error('Request timed out after 30s');
+    throw err;
   }
-
-  return await response.json();
 }
 
-/**
- * Get field-to-value mapping from Groq AI
- * @param {Array<Object>} fields - Detected form fields
- * @param {Object} profile - User profile data
- * @param {string} apiKey - Groq API key
- * @returns {Promise<Object>} - Field mapping object
- */
+// ─── Public API ───────────────────────────────────────────────────────────────
+
 async function getFieldMapping(fields, profile, apiKey) {
-  if (!apiKey) {
-    throw new Error('API key is required');
-  }
-
-  if (!fields || fields.length === 0) {
-    throw new Error('No fields provided');
-  }
-
-  if (!profile || typeof profile !== 'object') {
-    throw new Error('Invalid profile data');
-  }
-
-  console.log('[Groq API] Requesting field mapping for', fields.length, 'fields');
+  if (!apiKey) throw new Error('API key required');
+  if (!fields?.length) throw new Error('No fields provided');
+  if (!profile) throw new Error('No profile provided');
 
   const prompt = buildPrompt(fields, profile);
-  
-  // Retry logic with exponential backoff
+  let lastErr;
+
   for (let attempt = 1; attempt <= GROQ_API_CONFIG.MAX_RETRIES; attempt++) {
     try {
       console.log(`[Groq API] Attempt ${attempt}/${GROQ_API_CONFIG.MAX_RETRIES}`);
-      
-      // Create abort controller for timeout
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), GROQ_API_CONFIG.TIMEOUT);
-
-      const response = await makeGroqRequest(prompt, apiKey, controller.signal);
-      
-      clearTimeout(timeoutId);
-
-      // Extract content from response
-      const content = response.choices?.[0]?.message?.content;
-      
-      if (!content) {
-        throw new Error('No content in API response');
-      }
-
-      console.log('[Groq API] Raw response:', content);
-
-      // Extract JSON from content
-      const jsonString = extractJSONFromContent(content);
-      
-      if (!jsonString) {
-        throw new Error('No JSON found in response');
-      }
-
-      // Validate JSON
-      const mapping = validateJSONResponse(jsonString);
-      
-      if (!mapping) {
-        throw new Error('Invalid JSON in response');
-      }
-
-      console.log('[Groq API] Valid mapping received:', mapping);
+      const data = await makeRequest(prompt, apiKey);
+      const content = data.choices?.[0]?.message?.content;
+      if (!content) throw new Error('Empty AI response');
+      const mapping = parseMapping(content);
+      console.log('[Groq API] Mapping received:', mapping);
       return mapping;
-
-    } catch (error) {
-      console.error(`[Groq API] Attempt ${attempt} failed:`, error.message);
-      
-      // If it's the last attempt, throw the error
-      if (attempt === GROQ_API_CONFIG.MAX_RETRIES) {
-        throw error;
+    } catch (err) {
+      lastErr = err;
+      console.warn('[Groq API] Attempt failed:', err.message);
+      if (attempt < GROQ_API_CONFIG.MAX_RETRIES) {
+        await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
       }
-      
-      // Wait before retrying (exponential backoff)
-      const delay = Math.pow(2, attempt) * 1000;
-      console.log(`[Groq API] Waiting ${delay}ms before retry...`);
-      await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
+
+  throw lastErr;
 }
 
-/**
- * Test API connection
- * @param {string} apiKey - Groq API key
- * @returns {Promise<Object>} - Test result
- */
 async function testConnection(apiKey) {
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout for test
-
-    const response = await makeGroqRequest(
-      'Respond with "OK" to confirm connection.',
-      apiKey,
-      controller.signal
-    );
-
-    clearTimeout(timeoutId);
-
-    return {
-      success: true,
-      message: 'Connection successful'
-    };
-  } catch (error) {
-    return {
-      success: false,
-      error: error.message
-    };
+    await makeRequest('Reply with the single word OK.', apiKey);
+    return { success: true, message: 'Connection successful' };
+  } catch (err) {
+    return { success: false, error: err.message };
   }
 }
 
-/**
- * Validate API key format
- * @param {string} apiKey - The API key to validate
- * @returns {boolean} - True if valid format
- */
-function validateApiKeyFormat(apiKey) {
-  if (!apiKey || typeof apiKey !== 'string') {
-    return false;
-  }
-  
-  // Groq API keys typically start with 'gsk_'
-  return apiKey.startsWith('gsk_') && apiKey.length >= 32;
+function validateApiKeyFormat(key) {
+  return typeof key === 'string' && key.startsWith('gsk_') && key.length >= 32;
 }
 
-export {
-  GROQ_API_CONFIG,
-  getFieldMapping,
-  testConnection,
-  validateApiKeyFormat,
-  buildPrompt,
-  validateJSONResponse,
-  extractJSONFromContent
-};
+export { getFieldMapping, testConnection, validateApiKeyFormat, GROQ_API_CONFIG };

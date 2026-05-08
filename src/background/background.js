@@ -1,458 +1,329 @@
+/**
+ * Background Service Worker - Production Architecture
+ * 
+ * Job-based task system. Popup never waits on long responses.
+ * All AI calls happen here. Content scripts only do DOM work.
+ * 
+ * Flow:
+ *   popup.js → startJob() → background processes async → storage updated
+ *   popup.js polls GET_FILL_STATUS every 1s → reads result
+ */
+
 import { getFieldMapping, validateApiKeyFormat } from './utils/api.js';
 
-/**
- * Background Service Worker
- * Central coordinator for the extension
- * Handles message routing between popup and content scripts
- * API calls happen here for security
- */
+// ─── Job Store (in-memory, also mirrored to session storage) ──────────────────
+
+const jobs = new Map();
+
+function createJob(tabId, reviewMode) {
+  const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const job = {
+    jobId,
+    tabId,
+    status: 'pending',   // pending | running | awaiting_review | done | error
+    progress: '',
+    result: null,
+    error: null,
+    reviewMode,
+    createdAt: Date.now()
+  };
+  jobs.set(jobId, job);
+  persistJob(job);
+  return job;
+}
+
+function updateJob(jobId, patch) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+  Object.assign(job, patch);
+  persistJob(job);
+  // Broadcast to any open popups
+  chrome.runtime.sendMessage({ type: 'JOB_UPDATE', payload: job }).catch(() => {});
+}
+
+async function persistJob(job) {
+  try {
+    await chrome.storage.session.set({ [`job_${job.jobId}`]: job });
+  } catch (_) {
+    // session storage may not exist in older Chrome; fall back to local
+    try { await chrome.storage.local.set({ currentJob: job }); } catch (_) {}
+  }
+}
+
+// ─── Message Router ───────────────────────────────────────────────────────────
 
 class BackgroundService {
   constructor() {
-    this.fillingStatus = {
-      active: false,
-      result: null,
-      tabId: null,
-      reviewMode: false
-    };
-    this.init();
-  }
-
-  /**
-   * Initialize the background service
-   */
-  init() {
-    console.log('[AI Form Filler] Background service initializing...');
     this.setupMessageListener();
     this.setupInstallListener();
-    console.log('[AI Form Filler] Background service ready');
+    console.log('[Background] Service worker initialised');
   }
 
-  /**
-   * Setup message listener for communication with popup and content scripts
-   */
   setupMessageListener() {
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-      console.log('[AI Form Filler] Background received message:', message.type, 'from:', sender.tab?.id || 'popup');
-      
-      this.handleMessage(message, sender).then(sendResponse);
-      return true; // Keep message channel open for async response
+      console.log('[Background] Message received:', message.type, 'from', sender.tab?.id ?? 'popup');
+
+      // All handlers are async — we return true to keep the channel open,
+      // but we ALWAYS call sendResponse inside handleMessage (no dangling promises).
+      this.handleMessage(message, sender)
+        .then(sendResponse)
+        .catch(err => {
+          console.error('[Background] Unhandled error in handleMessage:', err);
+          sendResponse({ success: false, error: err.message });
+        });
+
+      return true; // keep message channel open
     });
   }
 
-  /**
-   * Handle incoming messages
-   * @param {Object} message - The message object
-   * @param {Object} sender - The sender information
-   * @returns {Promise<Object>} - Response object
-   */
   async handleMessage(message, sender) {
-    try {
-      switch (message.type) {
-        case 'DETECT_FIELDS':
-          return await this.handleDetectFields(message, sender);
-        
-        case 'GET_FIELD_COUNT':
-          return await this.handleGetFieldCount(message, sender);
-        
-        case 'HAS_FORMS':
-          return await this.handleHasForms(message, sender);
-        
-        case 'FILL_FORM':
-          return await this.handleFillForm(message, sender);
-        
-        case 'SAVE_API_KEY':
-          return await this.handleSaveApiKey(message);
-        
-        case 'GET_API_KEY':
-          return await this.handleGetApiKey();
-        
-        case 'TEST_API_KEY':
-          return await this.handleTestApiKey(message);
-        
-        case 'FIELD_METADATA':
-          return await this.handleFieldMetadata(message);
-        
-        case 'PING':
-          return { success: true, message: 'pong' };
-        
-        case 'GET_FILL_STATUS':
-          return { success: true, status: this.fillingStatus };
-        
-        case 'CLEAR_FILL_STATUS':
-          this.fillingStatus = { active: false, result: null, tabId: null, reviewMode: false };
-          return { success: true };
-        
-        default:
-          console.warn('[AI Form Filler] Unknown message type:', message.type);
-          return { success: false, error: 'Unknown message type' };
-      }
-    } catch (error) {
-      console.error('[AI Form Filler] Background message error:', error);
-      return { success: false, error: error.message };
+    switch (message.type) {
+
+      // Popup asks: start a fill job (fire-and-forget style)
+      case 'START_FILL_JOB':
+        return this.startFillJob(message.payload);
+
+      // Popup polls: what's the current job status?
+      case 'GET_JOB_STATUS':
+        return this.getJobStatus(message.payload?.jobId);
+
+      // Content script tells us review was confirmed
+      case 'REVIEW_CONFIRMED':
+        return this.handleReviewConfirmed(message.payload, sender);
+
+      // Content script tells us review was cancelled
+      case 'REVIEW_CANCELLED':
+        return this.handleReviewCancelled(message.payload);
+
+      // API key management
+      case 'SAVE_API_KEY':
+        return this.saveApiKey(message.payload);
+
+      case 'GET_API_KEY':
+        return this.getApiKeyStatus();
+
+      case 'TEST_API_KEY':
+        return this.testApiKey(message.payload);
+
+      // Legacy ping
+      case 'PING':
+        return { success: true, message: 'pong' };
+
+      default:
+        console.warn('[Background] Unknown message type:', message.type);
+        return { success: false, error: `Unknown message type: ${message.type}` };
     }
   }
 
-  /**
-   * Send message to content script with auto-injection fallback
-   * @param {number} tabId - The tab ID
-   * @param {Object} message - The message to send
-   * @returns {Promise<Object>} - Response from content script
-   */
-  async sendMessageToContentScript(tabId, message) {
-    try {
-      // Try sending message directly
-      return await chrome.tabs.sendMessage(tabId, message);
-    } catch (error) {
-      // Content script not loaded - inject it
-      console.log('[AI Form Filler] Content script not loaded, injecting...');
-      
-      try {
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          files: [
-            'src/content/utils/detectFields.js',
-            'src/content/utils/fillFields.js',
-            'src/content/utils/notification.js',
-            'src/content/components/ReviewModal.js',
-            'src/content/content.js'
-          ]
-        });
-        
-        console.log('[AI Form Filler] Content scripts injected successfully');
-        
-        // Wait a moment for scripts to initialize
-        await new Promise(resolve => setTimeout(resolve, 500));
-        
-        // Try sending message again
-        return await chrome.tabs.sendMessage(tabId, message);
-      } catch (injectError) {
-        console.error('[AI Form Filler] Failed to inject content script:', injectError);
-        throw new Error('Could not load content script. Make sure you are on a regular webpage (not chrome:// or edge:// pages).');
-      }
-    }
-  }
+  // ─── Fill Job Orchestrator ─────────────────────────────────────────────────
 
-  /**
-   * Handle field detection request
-   * Routes to content script to detect fields
-   * @param {Object} message - The message object
-   * @param {Object} sender - The sender information
-   * @returns {Promise<Object>} - Response with detected fields
-   */
-  async handleDetectFields(message, sender) {
-    try {
-      // Get the active tab
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      
-      if (!tab) {
-        console.error('[AI Form Filler] No active tab found');
-        return { success: false, error: 'No active tab found' };
-      }
-
-      console.log('[AI Form Filler] Sending DETECT_FIELDS to tab:', tab.id);
-      
-      // Send message to content script with auto-injection
-      const response = await this.sendMessageToContentScript(tab.id, {
-        type: 'DETECT_FIELDS'
-      });
-
-      console.log('[AI Form Filler] Received field detection response:', response);
-      return response;
-    } catch (error) {
-      console.error('[AI Form Filler] Error in handleDetectFields:', error);
-      return { success: false, error: error.message };
-    }
-  }
-
-  /**
-   * Handle get field count request
-   * Routes to content script to count fields
-   * @param {Object} message - The message object
-   * @param {Object} sender - The sender information
-   * @returns {Promise<Object>} - Response with field count
-   */
-  async handleGetFieldCount(message, sender) {
+  async startFillJob({ reviewMode = false } = {}) {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      
-      if (!tab) {
-        return { success: false, error: 'No active tab found' };
-      }
+      if (!tab) return { success: false, error: 'No active tab found' };
 
-      console.log('[AI Form Filler] Sending GET_FIELD_COUNT to tab:', tab.id);
-      
-      const response = await this.sendMessageToContentScript(tab.id, {
-        type: 'GET_FIELD_COUNT'
+      const job = createJob(tab.id, reviewMode);
+      console.log('[Background] Created job:', job.jobId);
+
+      // Run the pipeline asynchronously — don't await here so popup gets jobId immediately
+      this.runFillPipeline(job).catch(err => {
+        console.error('[Background] Pipeline error for', job.jobId, err);
+        updateJob(job.jobId, { status: 'error', error: err.message });
       });
 
-      console.log('[AI Form Filler] Received field count response:', response);
-      return response;
-    } catch (error) {
-      console.error('[AI Form Filler] Error in handleGetFieldCount:', error);
-      return { success: false, error: error.message };
+      return { success: true, jobId: job.jobId };
+    } catch (err) {
+      return { success: false, error: err.message };
     }
   }
 
-  /**
-   * Handle has forms request
-   * Routes to content script to check for forms
-   * @param {Object} message - The message object
-   * @param {Object} sender - The sender information
-   * @returns {Promise<Object>} - Response indicating if forms exist
-   */
-  async handleHasForms(message, sender) {
-    try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      
-      if (!tab) {
-        return { success: false, error: 'No active tab found' };
-      }
+  async runFillPipeline(job) {
+    const { jobId, tabId, reviewMode } = job;
 
-      console.log('[AI Form Filler] Sending HAS_FORMS to tab:', tab.id);
-      
-      const response = await this.sendMessageToContentScript(tab.id, {
-        type: 'HAS_FORMS'
+    // ── Step 1: inject / verify content script ─────────────────────────────
+    updateJob(jobId, { status: 'running', progress: 'Connecting to page...' });
+    await this.ensureContentScript(tabId);
+
+    // ── Step 2: detect fields ──────────────────────────────────────────────
+    updateJob(jobId, { progress: 'Detecting form fields...' });
+    const detectResp = await this.sendToContent(tabId, { type: 'DETECT_FIELDS' });
+    if (!detectResp?.success) throw new Error(detectResp?.error || 'Field detection failed');
+    if (!detectResp.count) throw new Error('No form fields found on this page');
+
+    // ── Step 3: load API key ───────────────────────────────────────────────
+    updateJob(jobId, { progress: 'Loading API configuration...' });
+    const apiKey = await this.getApiKey();
+    if (!apiKey) throw new Error('API key not configured. Add your Groq key in the extension popup.');
+
+    // ── Step 4: load profile ───────────────────────────────────────────────
+    updateJob(jobId, { progress: 'Loading profile...' });
+    const { userProfile: profile } = await chrome.storage.local.get('userProfile');
+    if (!profile?.name || !profile?.email)
+      throw new Error('Profile incomplete. Fill in at least name and email.');
+
+    // ── Step 5: call Groq AI ───────────────────────────────────────────────
+    updateJob(jobId, { progress: 'AI is analysing form fields...' });
+    const fieldMapping = await getFieldMapping(detectResp.fields, profile, apiKey);
+    console.log('[Background] AI mapping:', fieldMapping);
+
+    // ── Step 6a: review mode ───────────────────────────────────────────────
+    if (reviewMode) {
+      updateJob(jobId, {
+        status: 'awaiting_review',
+        progress: 'Waiting for your review...',
+        // stash mapping so content script gets it
+        _pendingMapping: fieldMapping,
+        _detectedFields: detectResp.fields
       });
 
-      console.log('[AI Form Filler] Received has forms response:', response);
-      return response;
-    } catch (error) {
-      console.error('[AI Form Filler] Error in handleHasForms:', error);
-      return { success: false, error: error.message };
+      // Ask content script to show review modal
+      await this.sendToContent(tabId, {
+        type: 'SHOW_REVIEW_MODAL',
+        payload: { jobId, fieldMapping, detectedFields: detectResp.fields }
+      });
+
+      return; // pipeline pauses here; resumes in handleReviewConfirmed
     }
+
+    // ── Step 6b: direct fill ───────────────────────────────────────────────
+    updateJob(jobId, { progress: 'Filling form fields...' });
+    const fillResp = await this.sendToContent(tabId, {
+      type: 'FILL_FIELDS',
+      payload: { fieldMapping, detectedFields: detectResp.fields }
+    });
+
+    updateJob(jobId, {
+      status: 'done',
+      progress: 'Complete',
+      result: {
+        filled: fillResp?.filled ?? 0,
+        skipped: fillResp?.skipped ?? 0,
+        errors: fillResp?.errors ?? []
+      }
+    });
+
+    console.log('[Background] Job complete:', jobId, fillResp);
   }
 
-  /**
-   * Handle fill form request
-   * Orchestrates the form filling process with AI
-   * @param {Object} message - The message object
-   * @param {Object} sender - The sender information
-   * @returns {Promise<Object>} - Response with fill results
-   */
-  async handleFillForm(message, sender) {
+  async handleReviewConfirmed({ jobId, confirmedMapping }, sender) {
+    const job = jobs.get(jobId);
+    if (!job) return { success: false, error: 'Job not found' };
+
     try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      
-      if (!tab) {
-        return { success: false, error: 'No active tab found' };
-      }
-
-      // Check if review mode is requested
-      const reviewMode = message.payload?.reviewMode || false;
-      console.log('[AI Form Filler] Starting fill form process for tab:', tab.id, 'review mode:', reviewMode);
-      
-      // Update status
-      this.fillingStatus = {
-        active: true,
-        result: null,
-        tabId: tab.id,
-        reviewMode: reviewMode
-      };
-      
-      // Step 1: Detect fields
-      console.log('[AI Form Filler] Step 1: Detecting fields...');
-      const detectResponse = await this.sendMessageToContentScript(tab.id, {
-        type: 'DETECT_FIELDS'
-      });
-
-      if (!detectResponse.success) {
-        console.error('[AI Form Filler] Field detection failed:', detectResponse.error);
-        return { success: false, error: detectResponse.error || 'Failed to detect fields' };
-      }
-
-      console.log('[AI Form Filler] Fields detected:', detectResponse.count);
-      
-      if (detectResponse.count === 0) {
-        return { success: false, error: 'No form fields found on this page' };
-      }
-      
-      // Step 2: Get API key
-      console.log('[AI Form Filler] Step 2: Getting API key...');
-      const apiKey = await this.getApiKey();
-      
-      if (!apiKey) {
-        return { success: false, error: 'API key not configured. Please add your Groq API key in the extension settings.' };
-      }
-
-      // Step 3: Get user profile from storage
-      console.log('[AI Form Filler] Step 3: Loading user profile...');
-      const profileData = await chrome.storage.local.get('userProfile');
-      const profile = profileData.userProfile || {};
-      
-      if (!profile.name || !profile.email) {
-        return { success: false, error: 'Please complete your profile (name and email required) before filling forms.' };
-      }
-
-      // Step 4: Call Groq API to get field mapping
-      console.log('[AI Form Filler] Step 4: Calling Groq API for field mapping...');
-      const fieldMapping = await getFieldMapping(detectResponse.fields, profile, apiKey);
-      
-      console.log('[AI Form Filler] AI mapping received:', fieldMapping);
-      
-      // Step 5: Send mapping to content script to fill fields (with review mode flag)
-      console.log('[AI Form Filler] Step 5: Filling fields...');
-      const fillResponse = await this.sendMessageToContentScript(tab.id, {
+      updateJob(jobId, { progress: 'Filling confirmed fields...' });
+      const fillResp = await this.sendToContent(job.tabId, {
         type: 'FILL_FIELDS',
-        payload: {
-          fieldMapping: fieldMapping,
-          reviewMode: reviewMode
+        payload: { fieldMapping: confirmedMapping, detectedFields: job._detectedFields || [] }
+      });
+
+      updateJob(jobId, {
+        status: 'done',
+        progress: 'Complete',
+        result: {
+          filled: fillResp?.filled ?? 0,
+          skipped: fillResp?.skipped ?? 0,
+          errors: fillResp?.errors ?? [],
+          reviewed: true
         }
       });
 
-      console.log('[AI Form Filler] Fill response:', fillResponse);
-      
-      const result = {
-        success: true,
-        filled: fillResponse.filled || 0,
-        skipped: fillResponse.skipped || 0,
-        errors: fillResponse.errors || [],
-        cancelled: fillResponse.cancelled || false
-      };
-
-      this.fillingStatus.active = false;
-      this.fillingStatus.result = result;
-
-      return result;
-    } catch (error) {
-      console.error('[AI Form Filler] Error in handleFillForm:', error);
-      
-      const errorResult = { 
-        success: false, 
-        error: error.message || 'Failed to fill form' 
-      };
-
-      // Provide user-friendly error messages
-      if (error.message.includes('API key')) {
-        errorResult.error = 'Invalid API key. Please check your Groq API key.';
-      } else if (error.message.includes('timeout')) {
-        errorResult.error = 'Request timed out. Please try again.';
-      } else if (error.message.includes('network') || error.message.includes('fetch')) {
-        errorResult.error = 'Network error. Please check your internet connection.';
-      }
-
-      this.fillingStatus.active = false;
-      this.fillingStatus.result = errorResult;
-      
-      return errorResult;
-    }
-  }
-
-  /**
-   * Handle save API key
-   * @param {Object} message - The message object
-   * @returns {Promise<Object>} - Response
-   */
-  async handleSaveApiKey(message) {
-    try {
-      const { apiKey } = message.payload || {};
-      
-      if (!apiKey) {
-        return { success: false, error: 'API key is required' };
-      }
-
-      if (!validateApiKeyFormat(apiKey)) {
-        return { success: false, error: 'Invalid API key format. Groq API keys should start with "gsk_"' };
-      }
-
-      await chrome.storage.local.set({ groqApiKey: apiKey.trim() });
-      console.log('[AI Form Filler] API key saved');
-      
       return { success: true };
-    } catch (error) {
-      console.error('[AI Form Filler] Error saving API key:', error);
-      return { success: false, error: error.message };
+    } catch (err) {
+      updateJob(jobId, { status: 'error', error: err.message });
+      return { success: false, error: err.message };
     }
   }
 
-  /**
-   * Handle get API key
-   * @returns {Promise<Object>} - Response with API key status
-   */
-  async handleGetApiKey() {
-    try {
-      const apiKey = await this.getApiKey();
-      return {
-        success: true,
-        hasKey: !!apiKey
-      };
-    } catch (error) {
-      console.error('[AI Form Filler] Error getting API key:', error);
-      return { success: false, error: error.message };
-    }
-  }
-
-  /**
-   * Handle test API key
-   * @param {Object} message - The message object
-   * @returns {Promise<Object>} - Response with test result
-   */
-  async handleTestApiKey(message) {
-    try {
-      const { apiKey } = message.payload || {};
-      
-      if (!apiKey) {
-        return { success: false, error: 'API key is required' };
-      }
-
-      if (!validateApiKeyFormat(apiKey)) {
-        return { success: false, error: 'Invalid API key format' };
-      }
-
-      const { testConnection } = await import('./utils/api.js');
-      const result = await testConnection(apiKey);
-      
-      return result;
-    } catch (error) {
-      console.error('[AI Form Filler] Error testing API key:', error);
-      return { success: false, error: error.message };
-    }
-  }
-
-  /**
-   * Get API key from storage
-   * @returns {Promise<string|null>} - The API key or null
-   */
-  async getApiKey() {
-    try {
-      const result = await chrome.storage.local.get('groqApiKey');
-      return result.groqApiKey || null;
-    } catch (error) {
-      console.error('[AI Form Filler] Error getting API key:', error);
-      return null;
-    }
-  }
-
-  /**
-   * Handle field metadata from content script
-   * @param {Object} message - The message object
-   * @returns {Promise<Object>} - Response
-   */
-  async handleFieldMetadata(message) {
-    console.log('[AI Form Filler] Field metadata received:', message.payload);
-    // Store metadata for later use
+  async handleReviewCancelled({ jobId }) {
+    updateJob(jobId, { status: 'done', result: { cancelled: true, filled: 0, skipped: 0 } });
     return { success: true };
   }
 
-  /**
-   * Setup install/update listener
-   */
-  setupInstallListener() {
-    chrome.runtime.onInstalled.addListener(async (details) => {
-      console.log('[AI Form Filler] Extension installed/updated:', details.reason);
-      
-      if (details.reason === 'install') {
-        console.log('[AI Form Filler] First time installation');
-        // Initialize default settings if needed
-      } else if (details.reason === 'update') {
-        console.log('[AI Form Filler] Extension updated to version:', chrome.runtime.getManifest().version);
+  // ─── Status ───────────────────────────────────────────────────────────────
+
+  async getJobStatus(jobId) {
+    if (!jobId) {
+      // Return most recent job if no ID given
+      let latest = null;
+      for (const j of jobs.values()) {
+        if (!latest || j.createdAt > latest.createdAt) latest = j;
       }
+      return { success: true, job: latest ?? null };
+    }
+    return { success: true, job: jobs.get(jobId) ?? null };
+  }
+
+  // ─── Content Script Helpers ───────────────────────────────────────────────
+
+  async ensureContentScript(tabId) {
+    try {
+      await chrome.tabs.sendMessage(tabId, { type: 'PING' });
+      console.log('[Background] Content script already active');
+    } catch (_) {
+      console.log('[Background] Injecting content scripts...');
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: [
+          'src/content/utils/detectFields.js',
+          'src/content/utils/fillFields.js',
+          'src/content/utils/notification.js',
+          'src/content/components/ReviewModal.js',
+          'src/content/content.js'
+        ]
+      });
+      await new Promise(r => setTimeout(r, 600));
+    }
+  }
+
+  async sendToContent(tabId, message, retries = 2) {
+    for (let i = 0; i <= retries; i++) {
+      try {
+        return await chrome.tabs.sendMessage(tabId, message);
+      } catch (err) {
+        if (i === retries) throw err;
+        console.warn(`[Background] Content message failed (attempt ${i + 1}), retrying...`);
+        await this.ensureContentScript(tabId);
+        await new Promise(r => setTimeout(r, 400));
+      }
+    }
+  }
+
+  // ─── API Key ──────────────────────────────────────────────────────────────
+
+  async saveApiKey({ apiKey } = {}) {
+    if (!apiKey) return { success: false, error: 'API key required' };
+    if (!validateApiKeyFormat(apiKey)) return { success: false, error: 'Invalid key format (must start with gsk_)' };
+    await chrome.storage.local.set({ groqApiKey: apiKey.trim() });
+    console.log('[Background] API key saved');
+    return { success: true };
+  }
+
+  async getApiKeyStatus() {
+    const key = await this.getApiKey();
+    return { success: true, hasKey: !!key };
+  }
+
+  async getApiKey() {
+    const { groqApiKey } = await chrome.storage.local.get('groqApiKey');
+    return groqApiKey || null;
+  }
+
+  async testApiKey({ apiKey } = {}) {
+    if (!apiKey || !validateApiKeyFormat(apiKey)) return { success: false, error: 'Invalid key' };
+    try {
+      const { testConnection } = await import('./utils/api.js');
+      return await testConnection(apiKey);
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+
+  setupInstallListener() {
+    chrome.runtime.onInstalled.addListener(({ reason }) => {
+      console.log('[Background] Extension installed/updated:', reason);
     });
   }
 }
 
-// Initialize background service
-const backgroundService = new BackgroundService();
-
-// Export for testing
-export default backgroundService;
+// Instantiate
+new BackgroundService();
